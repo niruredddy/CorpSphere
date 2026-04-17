@@ -47,7 +47,7 @@ const Layout = ({ children }) => {
                         <img src={user?.avatar} className="w-10 h-10 rounded-full border border-zinc-800" alt="User" />
                         <div className="flex-1 overflow-hidden">
                             <p className="text-sm font-bold truncate text-white">{user?.name}</p>
-                            <p className="text-[10px] text-emerald-500 font-mono truncate uppercase">{user?.role.replace('_', ' ')}</p>
+                            <p className="text-[10px] text-emerald-500 font-mono truncate uppercase">{user?.role?.replace('_', ' ') || 'MEMBER'}</p>
                         </div>
                     </div>
                     
@@ -66,9 +66,24 @@ const Layout = ({ children }) => {
                         {org ? `Connected to: ${org.name} Node` : 'System Architecture Layer'}
                    </div>
                    {org && (
-                       <div className="flex items-center gap-3 bg-white/5 px-3 py-1 rounded-full border border-white/10">
-                           <img src={org.logo} alt="Org Logo" className="w-5 h-5 rounded" />
-                           <span className="text-xs font-bold text-emerald-500">{org.name}</span>
+                       <div className="flex items-center gap-4">
+                           <button 
+                               onClick={() => window.open(`https://meet.jit.si/CorpSphere_${org.id}`, '_blank')}
+                               className="flex items-center gap-2 bg-zinc-900 border border-white/10 px-4 py-1.5 rounded-lg hover:border-emerald-500/50 hover:bg-emerald-500/10 transition-colors"
+                           >
+                               <span className="relative flex h-2 w-2">
+                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                               </span>
+                               <span className="text-xs font-bold text-white uppercase tracking-wider">Join Meeting</span>
+                           </button>
+                           
+                           <div className="h-4 w-px bg-white/10"></div>
+                           
+                           <div className="flex items-center gap-3 bg-white/5 px-3 py-1 rounded-full border border-white/10">
+                               <img src={org.logo} alt="Org Logo" className="w-5 h-5 rounded" />
+                               <span className="text-xs font-bold text-emerald-500">{org.name}</span>
+                           </div>
                        </div>
                    )}
                 </header>

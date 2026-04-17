@@ -15,10 +15,12 @@ const OrgOwnerDash = () => {
     const [newMember, setNewMember] = useState({ name: '', email: '', roleTitle: '' });
     const [copied, setCopied] = useState(false);
 
-    const filteredMembers = members.filter(m => 
-        m.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
-        m.roleTitle?.toLowerCase().includes(searchQuery.toLowerCase())
-    );
+    const filteredMembers = members.filter(m => {
+        const mName = m.name || '';
+        const mRole = m.roleTitle || '';
+        return mName.toLowerCase().includes(searchQuery.toLowerCase()) || 
+               mRole.toLowerCase().includes(searchQuery.toLowerCase());
+    });
 
     const handleAddMember = (e) => {
         e.preventDefault();

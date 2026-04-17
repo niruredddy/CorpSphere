@@ -1,184 +1,298 @@
 import React, { createContext, useState, useContext, useEffect } from 'react';
+import { auth, db as firestore, googleProvider } from '../firebase';
+import { 
+  onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, 
+  signOut, signInWithPopup
+} from 'firebase/auth';
+import { 
+  collection, doc, setDoc, getDoc, deleteDoc, onSnapshot, getDocs
+} from 'firebase/firestore';
 
 const AuthContext = createContext();
 
 const EMPTY_DB = { users: [], organizations: [], notes: [], activities: [], tasks: [] };
 
-const loadData = () => {
-  try {
-    const saved = localStorage.getItem('corpSphereDB');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      // Merge with defaults so old data missing new fields won't crash
-      return { ...EMPTY_DB, ...parsed };
-    }
-  } catch (e) {
-    console.error('Failed to load DB, resetting:', e);
-    localStorage.removeItem('corpSphereDB');
-  }
-  return { ...EMPTY_DB };
-};
-
 export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
-  const [db, setDb] = useState(loadData());
+  const [authUser, setAuthUser] = useState(null);
+  const [dbState, setDbState] = useState(EMPTY_DB);
   const [toast, setToast] = useState(null);
 
+  // Firestore specific: setup real-time listeners
   useEffect(() => {
-    localStorage.setItem('corpSphereDB', JSON.stringify(db));
-  }, [db]);
+    const unsubscibers = [];
+    
+    ['users', 'organizations', 'notes', 'activities', 'tasks'].forEach(collName => {
+      const unsub = onSnapshot(collection(firestore, collName), (snapshot) => {
+        setDbState(prev => ({
+          ...prev,
+          [collName]: snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+        }));
+      }, (error) => {
+        console.warn(`Error listening to ${collName}:`, error);
+      });
+      unsubscibers.push(unsub);
+    });
+
+    const unsubAuth = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        const userDoc = await getDoc(doc(firestore, 'users', firebaseUser.uid));
+        if (userDoc.exists()) {
+          setAuthUser({ id: firebaseUser.uid, ...userDoc.data() });
+        } else {
+          setAuthUser({ id: firebaseUser.uid, email: firebaseUser.email, name: firebaseUser.displayName });
+        }
+      } else {
+        setAuthUser(null);
+      }
+    });
+    unsubscibers.push(unsubAuth);
+
+    return () => unsubscibers.forEach(unsub => unsub());
+  }, []);
 
   const showToast = (message, type = 'success') => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 3000);
   };
 
-  const logActivity = (orgId, action) => {
-    if (!orgId) return; // skip for system admin or undefined org
-    const entry = { id: Date.now(), orgId, user: user?.name || 'System', action, time: new Date().toLocaleTimeString() };
-    setDb(prev => ({ ...prev, activities: [entry, ...(prev.activities || [])].slice(0, 50) }));
+  const logActivity = async (orgId, action) => {
+    if (!orgId) return;
+    const entry = { orgId, user: user?.name || 'System', action, time: new Date().toLocaleTimeString(), timestamp: Date.now() };
+    await setDoc(doc(firestore, 'activities', Date.now().toString()), entry);
   };
 
-  const login = (email, password, expectedRole) => {
-    const foundUser = db.users.find(u => u.email === email && u.password === password);
-    if (foundUser && (!expectedRole || foundUser.role === expectedRole)) {
-      setUser(foundUser);
-      logActivity(foundUser.orgId, `${foundUser.name} logged in`);
-      showToast(`Welcome back, ${foundUser.name}!`);
-      return true;
+  // Google Sign-in Handler
+  const loginWithGoogle = async () => {
+    try {
+      const result = await signInWithPopup(auth, googleProvider);
+      const userRef = doc(firestore, 'users', result.user.uid);
+      const docSnap = await getDoc(userRef);
+      
+      if (!docSnap.exists()) {
+         // Create default user profile if they don't exist
+         const newUser = {
+           role: 'MEMBER', 
+           name: result.user.displayName, 
+           email: result.user.email,
+           avatar: result.user.photoURL,
+           status: 'online', github: '', bio: '', orgId: ''
+         };
+         await setDoc(userRef, newUser);
+      }
+      showToast(`Welcome, ${result.user.displayName}!`);
+      return { success: true };
+    } catch (error) {
+      showToast(error.message, 'error');
+      return { error: error.message };
     }
-    return false;
   };
 
-  const logout = () => {
-    if (user) logActivity(user.orgId, `${user.name} signed out`);
-    setUser(null);
+  const login = async (email, password, expectedRole) => {
+    try {
+      const userCredential = await signInWithEmailAndPassword(auth, email, password);
+      // Expected Role checks can be done after fetching the profile
+      const userDoc = await getDoc(doc(firestore, 'users', userCredential.user.uid));
+      if (userDoc.exists() && expectedRole && userDoc.data().role !== expectedRole) {
+        throw new Error(`Access denied. You do not have the ${expectedRole} role.`);
+      }
+      showToast(`Welcome back!`);
+      return true;
+    } catch (error) {
+       showToast(error.message, 'error');
+       return false;
+    }
   };
 
-  const checkEmail = (email) => !!db.users.find(u => u.email === email);
-
-  const signupAdmin = (name, email, password) => {
-    if (checkEmail(email)) return { error: 'Email already in use' };
-    const newUser = { id: `u${Date.now()}`, role: 'SYSTEM_ADMIN', name, email, password, avatar: `https://ui-avatars.com/api/?name=${name}&background=10b981&color=fff`, status: 'online' };
-    setDb(prev => ({ ...prev, users: [...prev.users, newUser] }));
-    setUser(newUser);
-    showToast('System Admin account created!');
-    return { success: true };
+  const logout = async () => {
+    if (user) await logActivity(user.orgId, `${user.name} signed out`);
+    await signOut(auth);
+    showToast('Logged out');
   };
 
-  const signupOrgOwner = (name, email, password, orgName) => {
-    if (checkEmail(email)) return { error: 'Email already in use' };
-    const newOrg = {
-      id: `org_${Date.now()}`, name: orgName,
-      logo: `https://ui-avatars.com/api/?name=${orgName.replace(/ /g, '+')}&background=10b981&color=fff`,
-      stats: { velocity: 100, growth: 100, activeProjects: 0 },
-      createdAt: new Date().toLocaleDateString()
+  const signupAdmin = async (name, email, password) => {
+    try {
+      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      const newUser = { 
+        role: 'SYSTEM_ADMIN', name, email, 
+        avatar: `https://ui-avatars.com/api/?name=${name}&background=10b981&color=fff`, 
+        status: 'online' 
+      };
+      await setDoc(doc(firestore, 'users', userCredential.user.uid), newUser);
+      showToast('System Admin account created!');
+      return { success: true };
+    } catch (error) {
+       showToast(error.message, 'error');
+       return { error: error.message };
+    }
+  };
+
+  const signupOrgOwner = async (name, email, password, orgName) => {
+    try {
+      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      const newOrgId = `org_${Date.now()}`;
+      const newOrg = {
+        name: orgName,
+        logo: `https://ui-avatars.com/api/?name=${orgName.replace(/ /g, '+')}&background=10b981&color=fff`,
+        stats: { velocity: 100, growth: 100, activeProjects: 0 },
+        createdAt: new Date().toLocaleDateString()
+      };
+      await setDoc(doc(firestore, 'organizations', newOrgId), newOrg);
+      
+      const newUser = { 
+        role: 'ORG_OWNER', orgId: newOrgId, name, email, 
+        avatar: `https://ui-avatars.com/api/?name=${name.replace(/ /g, '+')}&background=10b981&color=fff`, 
+        status: 'online' 
+      };
+      await setDoc(doc(firestore, 'users', userCredential.user.uid), newUser);
+      
+      await logActivity(newOrgId, `Organization "${orgName}" was created`);
+      showToast(`Organization "${orgName}" provisioned!`);
+      return { success: true };
+    } catch (error) {
+       showToast(error.message, 'error');
+       return { error: error.message };
+    }
+  };
+
+  const signupMember = async (name, email, password, orgId, roleTitle) => {
+    try {
+      const orgDoc = await getDoc(doc(firestore, 'organizations', orgId));
+      if (!orgDoc.exists()) return { error: 'Invalid Organization ID. Ask your Org Owner for the correct ID.' };
+      
+      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      const newUser = { 
+        role: 'MEMBER', orgId, name, email, roleTitle, progress: 0, 
+        avatar: `https://ui-avatars.com/api/?name=${name.replace(/ /g, '+')}&background=10b981&color=fff`, 
+        status: 'online', github: '', bio: '' 
+      };
+      await setDoc(doc(firestore, 'users', userCredential.user.uid), newUser);
+
+      // Onboarding "Welcome Mission" tasks based on role
+      const onboardingTasks = [
+        { title: `Complete ${roleTitle} Profile setup`, priority: 'high' },
+        { title: `Review ${roleTitle} documentation and guidelines`, priority: 'medium' },
+        { title: `Introduce yourself to the team`, priority: 'low' }
+      ];
+
+      for (const t of onboardingTasks) {
+        const taskId = Date.now().toString() + Math.random().toString(36).substr(2, 5);
+        const task = { orgId, title: t.title, assignee: name, priority: t.priority, status: 'todo', createdAt: new Date().toLocaleDateString() };
+        await setDoc(doc(firestore, 'tasks', taskId), task);
+      }
+      
+      await logActivity(orgId, `${name} joined as ${roleTitle}`);
+      showToast(`Welcome to ${orgDoc.data().name}!`);
+      return { success: true };
+    } catch (error) {
+       showToast(error.message, 'error');
+       return { error: error.message };
+    }
+  };
+
+  const updateUserProfile = async (updatedData) => {
+    try {
+      await setDoc(doc(firestore, 'users', user.id), updatedData, { merge: true });
+      await logActivity(user.orgId, `${user.name} updated their profile`);
+      showToast('Profile saved!');
+    } catch(e) {
+      showToast('Failed to update profile', 'error');
+    }
+  };
+
+  const addMemberToOrg = async (orgId, memberData) => {
+    // Note: Creating a user via admin auth or link is preferred, but here we just add a stub in the DB
+    const newUserId = `u${Date.now()}`;
+    const newUser = { 
+        orgId, role: 'MEMBER', ...memberData, progress: 0, 
+        avatar: `https://ui-avatars.com/api/?name=${memberData.name?.replace(/ /g, '+')}&background=10b981&color=fff`, 
+        status: 'offline', github: '', bio: '' 
     };
-    const newUser = { id: `u${Date.now()}`, role: 'ORG_OWNER', orgId: newOrg.id, name, email, password, avatar: `https://ui-avatars.com/api/?name=${name.replace(/ /g, '+')}&background=10b981&color=fff`, status: 'online' };
-    setDb(prev => ({ ...prev, organizations: [...prev.organizations, newOrg], users: [...prev.users, newUser] }));
-    setUser(newUser);
-    logActivity(newOrg.id, `Organization "${orgName}" was created`);
-    showToast(`Organization "${orgName}" provisioned!`);
-    return { success: true };
-  };
-
-  const signupMember = (name, email, password, orgId, roleTitle) => {
-    if (checkEmail(email)) return { error: 'Email already in use' };
-    const orgExists = db.organizations.find(o => o.id === orgId);
-    if (!orgExists) return { error: 'Invalid Organization ID. Ask your Org Owner for the correct ID.' };
-    const newUser = { id: `u${Date.now()}`, role: 'MEMBER', orgId, name, email, password, roleTitle, progress: 0, avatar: `https://ui-avatars.com/api/?name=${name.replace(/ /g, '+')}&background=10b981&color=fff`, status: 'online', github: '', bio: '' };
-    setDb(prev => ({ ...prev, users: [...prev.users, newUser] }));
-    setUser(newUser);
-    logActivity(orgId, `${name} joined as ${roleTitle}`);
-    showToast(`Welcome to ${orgExists.name}!`);
-    return { success: true };
-  };
-
-  const updateUserProfile = (updatedData) => {
-    setDb(prev => ({ ...prev, users: prev.users.map(u => u.id === user.id ? { ...u, ...updatedData } : u) }));
-    setUser(prev => ({ ...prev, ...updatedData }));
-    logActivity(user.orgId, `${user.name} updated their profile`);
-    showToast('Profile saved!');
-  };
-
-  const addMemberToOrg = (orgId, memberData) => {
-    const newUser = { id: `u${Date.now()}`, orgId, role: 'MEMBER', ...memberData, progress: 0, avatar: `https://ui-avatars.com/api/?name=${memberData.name?.replace(/ /g, '+')}&background=10b981&color=fff`, password: 'password', status: 'offline', github: '', bio: '' };
-    setDb(prev => ({ ...prev, users: [...prev.users, newUser] }));
-    logActivity(orgId, `${memberData.name} was added to the organization`);
+    await setDoc(doc(firestore, 'users', newUserId), newUser);
+    await logActivity(orgId, `${memberData.name} was added to the organization`);
     showToast(`${memberData.name} added!`);
   };
 
-  const removeMember = (memberId) => {
-    const member = db.users.find(u => u.id === memberId);
-    setDb(prev => ({ ...prev, users: prev.users.filter(u => u.id !== memberId) }));
-    if (member) {
-      logActivity(member.orgId, `${member.name} was removed`);
-      showToast(`${member.name} removed`, 'warning');
+  const removeMember = async (memberId) => {
+    try {
+      const member = dbState.users.find(u => u.id === memberId);
+      await deleteDoc(doc(firestore, 'users', memberId));
+      if (member) {
+        await logActivity(member.orgId, `${member.name} was removed`);
+        showToast(`${member.name} removed`, 'warning');
+      }
+    } catch(e) {
+      console.error(e);
     }
   };
 
-  const addOrg = (orgData) => {
-    const newOrg = { id: `org_${Date.now()}`, stats: { velocity: 100, growth: 100, activeProjects: 0 }, logo: `https://ui-avatars.com/api/?name=${orgData.name?.replace(/ /g, '+')}&background=10b981&color=fff`, createdAt: new Date().toLocaleDateString(), ...orgData };
-    setDb(prev => ({ ...prev, organizations: [...prev.organizations, newOrg] }));
+  const addOrg = async (orgData) => {
+    const newOrgId = `org_${Date.now()}`;
+    const newOrg = { 
+      stats: { velocity: 100, growth: 100, activeProjects: 0 }, 
+      logo: `https://ui-avatars.com/api/?name=${orgData.name?.replace(/ /g, '+')}&background=10b981&color=fff`, 
+      createdAt: new Date().toLocaleDateString(), 
+      ...orgData 
+    };
+    await setDoc(doc(firestore, 'organizations', newOrgId), newOrg);
     showToast(`${orgData.name} provisioned!`);
   };
 
-  const removeOrg = (orgId) => {
-    const org = db.organizations.find(o => o.id === orgId);
-    setDb(prev => ({ ...prev, organizations: prev.organizations.filter(o => o.id !== orgId), users: prev.users.filter(u => u.orgId !== orgId), notes: prev.notes.filter(n => n.orgId !== orgId), activities: prev.activities.filter(a => a.orgId !== orgId) }));
-    showToast(`${org?.name || 'Organization'} decommissioned`, 'warning');
+  const removeOrg = async (orgId) => {
+    await deleteDoc(doc(firestore, 'organizations', orgId));
+    // Additional cleanup could drop members/tasks. Skipping deep-clean for simplicity in this demo.
+    showToast(`Organization decommissioned`, 'warning');
   };
 
-  const updateProgress = (progressVal) => {
-    updateUserProfile({ progress: progressVal });
+  const updateProgress = async (progressVal) => {
+    await updateUserProfile({ progress: progressVal });
   };
 
   // Notes
-  const addNote = (orgId, content) => {
-    const newNote = { id: Date.now(), orgId, author: user.name, content, date: new Date().toLocaleDateString() };
-    setDb(prev => ({ ...prev, notes: [newNote, ...prev.notes] }));
-    logActivity(orgId, `${user.name} posted a notice`);
+  const addNote = async (orgId, content) => {
+    const newNoteId = Date.now().toString();
+    const newNote = { orgId, author: user.name, content, date: new Date().toLocaleDateString(), stamp: Date.now() };
+    await setDoc(doc(firestore, 'notes', newNoteId), newNote);
+    await logActivity(orgId, `${user.name} posted a notice`);
     showToast('Notice posted!');
   };
-  const removeNote = (noteId) => {
-    setDb(prev => ({ ...prev, notes: prev.notes.filter(n => n.id !== noteId) }));
+  
+  const removeNote = async (noteId) => {
+    await deleteDoc(doc(firestore, 'notes', noteId.toString()));
     showToast('Notice removed', 'warning');
   };
-  const getOrgNotes = (orgId) => (db.notes || []).filter(n => n.orgId === orgId);
+  
+  const getOrgNotes = (orgId) => (dbState.notes || []).filter(n => n.orgId === orgId).sort((a,b) => b.stamp - a.stamp);
 
   // Tasks / Kanban
-  const addTask = (orgId, title, assignee, priority) => {
-    const task = { id: Date.now(), orgId, title, assignee, priority, status: 'todo', createdAt: new Date().toLocaleDateString() };
-    setDb(prev => ({ ...prev, tasks: [...prev.tasks, task] }));
-    logActivity(orgId, `Task "${title}" created`);
+  const addTask = async (orgId, title, assignee, priority) => {
+    const taskId = Date.now().toString();
+    const task = { orgId, title, assignee, priority, status: 'todo', createdAt: new Date().toLocaleDateString() };
+    await setDoc(doc(firestore, 'tasks', taskId), task);
+    await logActivity(orgId, `Task "${title}" created`);
     showToast('Task created!');
   };
-  const updateTaskStatus = (taskId, newStatus) => {
-    setDb(prev => ({ ...prev, tasks: prev.tasks.map(t => t.id === taskId ? { ...t, status: newStatus } : t) }));
+  const updateTaskStatus = async (taskId, newStatus) => {
+    await setDoc(doc(firestore, 'tasks', taskId.toString()), { status: newStatus }, { merge: true });
   };
-  const removeTask = (taskId) => {
-    setDb(prev => ({ ...prev, tasks: (prev.tasks || []).filter(t => t.id !== taskId) }));
+  const removeTask = async (taskId) => {
+    await deleteDoc(doc(firestore, 'tasks', taskId.toString()));
   };
 
-  const getOrgTasks = (orgId) => (db.tasks || []).filter(t => t.orgId === orgId);
-
-  const getOrgActivities = (orgId) => (db.activities || []).filter(a => a.orgId === orgId);
-
-  const getOrgDetails = (orgId) => (db.organizations || []).find(o => o.id === orgId) || { name: 'Unknown', stats: { velocity: 0 } };
-
-  const getOrgMembers = (orgId) => (db.users || []).filter(u => u.orgId === orgId && u.role === 'MEMBER');
-
-  const getAllOrgs = () => (db.organizations || []);
+  const getOrgTasks = (orgId) => (dbState.tasks || []).filter(t => t.orgId === orgId);
+  const getOrgActivities = (orgId) => (dbState.activities || []).filter(a => a.orgId === orgId).sort((a,b)=> b.timestamp - a.timestamp).slice(0, 50);
+  const getOrgDetails = (orgId) => (dbState.organizations || []).find(o => o.id === orgId) || { name: 'Unknown', stats: { velocity: 0 } };
+  const getOrgMembers = (orgId) => (dbState.users || []).filter(u => u.orgId === orgId && u.role === 'MEMBER');
+  const getAllOrgs = () => (dbState.organizations || []);
 
   const clearStorage = () => {
-    localStorage.removeItem('corpSphereDB');
-    setDb({ ...EMPTY_DB });
-    setUser(null);
+    showToast("This feature requires deleting collections in Firebase console.");
   };
+
+  const user = authUser ? { ...authUser, ...(dbState.users.find(u => u.id === authUser.id) || {}) } : null;
 
   return (
     <AuthContext.Provider value={{
-      user, login, logout, getOrgDetails, getOrgMembers, getAllOrgs, updateUserProfile, db, toast,
+      user, login, loginWithGoogle, logout, getOrgDetails, getOrgMembers, getAllOrgs, updateUserProfile, db: dbState, toast,
       addMemberToOrg, removeMember, addOrg, removeOrg, updateProgress,
       signupAdmin, signupOrgOwner, signupMember, addNote, removeNote, getOrgNotes,
       addTask, updateTaskStatus, removeTask, getOrgTasks, getOrgActivities, showToast, clearStorage
